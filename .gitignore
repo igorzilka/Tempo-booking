@@ -1,0 +1,37 @@
+node_modules/
+dist/
+browser-data/
+artifacts/
+
+# Data files
+worklogs.json
+booking-results.json
+scraped-attendance.json
+parsed-worklogs.json
+final-worklogs*.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+
+# TypeScript
+*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Playwright
+test-results/
+playwright-report/
+playwright/.cache/

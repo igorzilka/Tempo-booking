@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(timeout:*)",
+      "Bash(taskkill /F /IM node.exe)",
+      "Bash(taskkill /F /IM chrome.exe)"
+    ]
+  }
+}

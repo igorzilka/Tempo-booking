@@ -1,0 +1,32 @@
+{
+  "name": "tempo-worklog-automation",
+  "version": "1.0.0",
+  "description": "Attended automation for Jira Tempo worklog creation using Playwright",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "book": "npm run build && node dist/book-unified.js",
+    "scrape-attendance": "npm run build && node dist/scrape-cli.js"
+  },
+  "keywords": [
+    "jira",
+    "tempo",
+    "worklog",
+    "automation",
+    "playwright",
+    "attended"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "^1.49.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.10",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
