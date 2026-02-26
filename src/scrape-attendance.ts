@@ -1,10 +1,8 @@
 import { Page } from 'playwright';
 import * as fs from 'fs';
-import { JIRA_BASE_URL, PROJECT_ROOT } from './types.js';
+import { PROJECT_ROOT, TIMEDIFF_URL } from './types.js';
 import { waitIfLoginRedirect } from './tempo-ui.js';
 import * as path from 'path';
-
-const TIMEDIFF_URL = `${JIRA_BASE_URL}/secure/TimeDiff.jspa`;
 
 export interface AttendanceEntry {
   date: string;

@@ -14,6 +14,7 @@ export const JIRA_ISSUES = {
 } as const;
 
 export const JIRA_BASE_URL = 'https://jira.uniqagroup.com';
+export const TIMEDIFF_URL = `${JIRA_BASE_URL}/secure/TimeDiff.jspa`;
 
 /**
  * Input for creating a worklog entry in Tempo

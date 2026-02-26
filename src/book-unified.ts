@@ -6,7 +6,7 @@
 import { Browser, Page } from 'playwright';
 import { ensureAuthenticated, launchBrowser, waitIfLoginRedirect } from './tempo-ui.js';
 import { scrapeAttendanceFromTimeDiff, AttendanceEntry } from './scrape-attendance.js';
-import { CreateWorklogInput, CreateWorklogResult, JIRA_BASE_URL, JIRA_ISSUES, PROJECT_ROOT } from './types.js';
+import { CreateWorklogInput, CreateWorklogResult, JIRA_ISSUES, PROJECT_ROOT, TIMEDIFF_URL } from './types.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -66,150 +66,175 @@ function distributeHours(sapHours: number): WorklogDistribution[] {
   }
 }
 
-async function createWorklogFast(page: Page, input: CreateWorklogInput): Promise<CreateWorklogResult> {
-  const { issueKey, date, hours, note } = input;
+/**
+ * Navigate to the TimeDiff page and wait for the attendance table
+ * AND SAP data to be fully loaded (SAP data loads asynchronously).
+ */
+async function navigateToTimeDiff(page: Page): Promise<void> {
+  await page.goto(TIMEDIFF_URL, { waitUntil: 'domcontentloaded' });
+
+  if (page.url().includes('login') || page.url().includes('auth') || page.url().includes('sso')) {
+    await waitIfLoginRedirect(page);
+    await page.goto(TIMEDIFF_URL, { waitUntil: 'domcontentloaded' });
+  }
+
+  await page.waitForSelector('table', { timeout: 15000, state: 'visible' });
+
+  // Wait for SAP data to actually populate (loaded asynchronously)
+  await page.waitForFunction(`(() => {
+    const rows = document.querySelectorAll('table tr');
+    for (const row of rows) {
+      const firstCell = row.querySelector('td, th');
+      const label = (firstCell?.textContent || '').toLowerCase();
+      if (label.includes('attendance') && label.includes('sap')) {
+        const cells = row.querySelectorAll('td, th');
+        for (let i = 2; i < cells.length; i++) {
+          const text = (cells[i]?.textContent || '').trim();
+          if (/\\d/.test(text)) return true;
+        }
+      }
+    }
+    return false;
+  })()`, { timeout: 15000 });
+}
+
+/**
+ * Book a worklog directly from the TimeDiff page by clicking the underlined
+ * difference value for the target date, then filling the Log Work dialog.
+ */
+async function createWorklogFromTimeDiff(page: Page, input: CreateWorklogInput, useRemainingDiff = false): Promise<CreateWorklogResult> {
+  const { issueKey, date, hours } = input;
+  const targetDay = parseInt(date.split('-')[2], 10);
 
   console.log(`📝 ${issueKey} (${hours}h)`);
 
   try {
-    const issueUrl = `${JIRA_BASE_URL}/browse/${issueKey}`;
-    await page.goto(issueUrl, { waitUntil: 'domcontentloaded' });
+    // Find column index for the target day from the header row
+    const table = page.locator('table').first();
+    const headerCells = await table.locator('tr').first().locator('th, td').allTextContents();
 
-    // If SSO session expired, wait for re-authentication then reload the issue page
-    if (page.url().includes('login') || page.url().includes('auth') || page.url().includes('sso')) {
-      await waitIfLoginRedirect(page);
-      await page.goto(issueUrl, { waitUntil: 'domcontentloaded' });
-    }
-
-    // Wait for page to be ready
-    await page.waitForSelector('#summary-val, [data-testid="issue.views.issue-base.foundation.summary.heading"]', {
-      timeout: 10000,
-      state: 'visible'
-    });
-
-    // Click "Log Work" button
-    const logWorkButton = page.locator('a:has-text("Log Work")').first();
-    await logWorkButton.click();
-
-    // Wait for dialog
-    await page.waitForSelector('h2:has-text("Log Work")', {
-      timeout: 5000,
-      state: 'visible'
-    });
-
-    // Fill Time Spent field
-    const timeSpentSelectors = [
-      'label:has-text("Time Spent") + input',
-      'label:has-text("Time Spent") ~ input',
-      'input[placeholder*="3w 4d 12h"]',
-      'input[id*="log-work"][id*="time"]',
-    ];
-
-    let timeFieldFilled = false;
-    for (const selector of timeSpentSelectors) {
-      try {
-        const timeField = page.locator(selector).first();
-        if (await timeField.isVisible({ timeout: 1500 })) {
-          await timeField.clear();
-          await timeField.fill(`${hours}h`);
-          timeFieldFilled = true;
-          break;
-        }
-      } catch {
-        continue;
+    let colIndex = -1;
+    for (let i = 0; i < headerCells.length; i++) {
+      const header = headerCells[i].trim();
+      const dayMatch = header.match(/^(\d{1,2})[A-Z]?$/i);
+      if (dayMatch && parseInt(dayMatch[1], 10) === targetDay) {
+        colIndex = i;
+        break;
       }
     }
 
-    if (!timeFieldFilled) {
-      throw new Error('Could not find Time Spent field');
+    if (colIndex === -1) {
+      throw new Error(`Could not find column for day ${targetDay} in header row`);
     }
 
-    // Fill Date Started field
-    const [year, month, day] = date.split('-');
-    const formattedDate = `${day}.${month}.${year} 09:00`;
+    // Find the Difference row and click the value in the target column.
+    // The clickable element may be an <a>, <span>, or the cell itself.
+    const allRows = await table.locator('tr').all();
+    let clicked = false;
 
-    const dateSelectors = [
-      'label:has-text("Date Started") + input',
-      'label:has-text("Date Started") ~ input',
-      'input[id*="date"][id*="start"]',
-      'input[placeholder*="date"]',
-    ];
+    for (const row of allRows) {
+      const cells = await row.locator('td, th').all();
+      if (cells.length === 0) continue;
 
-    let dateFieldFilled = false;
-    for (const selector of dateSelectors) {
-      try {
-        const dateField = page.locator(selector).first();
-        if (await dateField.isVisible({ timeout: 1500 })) {
-          await dateField.clear();
-          await dateField.fill(formattedDate);
-          dateFieldFilled = true;
-          break;
+      const firstCellText = (await cells[0].textContent()) ?? '';
+      if (firstCellText.toLowerCase().includes('differ')) {
+        if (colIndex >= cells.length) {
+          throw new Error(`Column ${colIndex} out of bounds (${cells.length} cells in Difference row)`);
         }
-      } catch {
-        continue;
-      }
-    }
 
-    if (!dateFieldFilled) {
-      throw new Error('Could not find Date Started field');
-    }
+        const targetCell = cells[colIndex];
+        const cellText = (await targetCell.textContent())?.trim() ?? '';
+        console.log(`   → Difference cell text for day ${targetDay}: "${cellText}"`);
 
-    // Fill description if provided
-    if (note) {
-      const descSelectors = [
-        'textarea[id*="description"]',
-        'label:has-text("Work Description") + textarea',
-      ];
-
-      for (const selector of descSelectors) {
-        try {
-          const descField = page.locator(selector).first();
-          if (await descField.isVisible({ timeout: 1500 })) {
-            await descField.clear();
-            await descField.fill(note);
-            break;
+        // Try clicking in order: <a> link, <span>, or the cell itself
+        const link = targetCell.locator('a').first();
+        if (await link.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await link.click();
+          clicked = true;
+        } else {
+          const span = targetCell.locator('span').first();
+          if (await span.isVisible({ timeout: 1000 }).catch(() => false)) {
+            await span.click();
+            clicked = true;
+          } else if (cellText && /\d/.test(cellText)) {
+            // Cell has numeric content — click the cell directly
+            await targetCell.click();
+            clicked = true;
+          } else {
+            throw new Error(`Difference cell for day ${targetDay} has no clickable content (text: "${cellText}")`);
           }
-        } catch {
-          continue;
         }
+        break;
       }
     }
 
-    // Click "Log" button
-    const submitBtn = page.locator('button:text-is("Log")').last();
-    await submitBtn.click();
+    if (!clicked) {
+      throw new Error('Could not find Difference row in the table');
+    }
 
-    // CRITICAL: Wait for success or error indicator
-    // Selector promises swallow rejections so only the timeout fallback resolves
-    // when neither selector matches (avoids non-deterministic Promise.race behavior)
+    // Wait for the Log Work dialog by its heading (avoids matching hidden dialog shells)
+    const dialogHeading = page.locator('h2:has-text("Log Work"), h1:has-text("Log Work")').first();
+    await dialogHeading.waitFor({ timeout: 5000, state: 'visible' });
+    await page.waitForTimeout(500); // Let dialog fully render
+
+    // Fill Issue Key field
+    const issueKeyField = page.locator('#input-issue-key');
+    await issueKeyField.waitFor({ timeout: 3000, state: 'visible' });
+    await issueKeyField.fill(issueKey);
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Tab');
+
+    // Fill Worked(h) field — for the last booking per date, keep the pre-filled
+    // remaining difference to absorb any Tempo rounding gaps.
+    const workedField = page.locator('#input-worked');
+    await workedField.waitFor({ timeout: 3000, state: 'visible' });
+    if (useRemainingDiff) {
+      const prefilled = await workedField.inputValue();
+      console.log(`   → Using remaining difference: ${prefilled}h (instead of calculated ${hours}h)`);
+    } else {
+      await workedField.fill(hours.toString());
+    }
+
+    // Click "Log Work" submit button
+    await page.locator('#dialog-logwork-button').click();
+
+    // Wait for dialog to close (heading disappears) or error
     const result = await Promise.race([
-      page.waitForSelector('.aui-message.aui-message-success, [data-testid="issue.views.common.flag-message.success"]', {
-        timeout: 6000,
-        state: 'visible'
-      }).then(() => 'success' as const).catch(() => new Promise<never>(() => {})),
-      page.waitForSelector('.aui-message.aui-message-error, .error, [role="alert"]:has-text("error"), [role="alert"]:has-text("failed")', {
-        timeout: 6000,
-        state: 'visible'
+      dialogHeading.waitFor({ timeout: 10000, state: 'hidden' })
+        .then(() => 'success' as const).catch(() => new Promise<never>(() => {})),
+      page.waitForSelector('.aui-message-error, .error-message', {
+        timeout: 10000, state: 'visible'
       }).then(() => 'error' as const).catch(() => new Promise<never>(() => {})),
-      page.waitForTimeout(5000).then(() => 'timeout' as const)
+      page.waitForTimeout(9000).then(() => 'timeout' as const),
     ]);
 
     if (result === 'success') {
+      await page.waitForTimeout(500); // Let page refresh difference values
       console.log(`   ✅ ${issueKey} SUCCESS`);
       return {
         status: 'created',
         message: `Worklog created: ${hours}h on ${date}`,
       };
     } else if (result === 'error') {
-      throw new Error('Jira showed error message after submit');
+      throw new Error('Error message appeared in the Log Work dialog');
     } else {
-      throw new Error('Timeout: No success or error message detected');
+      // Timeout — check if dialog already closed
+      const headingStillVisible = await dialogHeading.isVisible().catch(() => false);
+      if (!headingStillVisible) {
+        await page.waitForTimeout(500);
+        console.log(`   ✅ ${issueKey} SUCCESS (dialog closed)`);
+        return {
+          status: 'created',
+          message: `Worklog created: ${hours}h on ${date}`,
+        };
+      }
+      throw new Error('Timeout: dialog did not close after clicking Log Work');
     }
 
   } catch (error) {
     console.error(`   ❌ ${issueKey} FAILED: ${error}`);
 
-    // Screenshot ONLY ON FAILURE
+    // Screenshot on failure
     try {
       const artifactsDir = path.join(PROJECT_ROOT, 'artifacts');
       if (!fs.existsSync(artifactsDir)) {
@@ -219,6 +244,15 @@ async function createWorklogFast(page: Page, input: CreateWorklogInput): Promise
       const screenshotPath = path.join(artifactsDir, `error-${issueKey}-${date}-${timestamp}.png`);
       await page.screenshot({ path: screenshotPath, fullPage: true });
       console.error(`   📸 Screenshot: ${screenshotPath}`);
+    } catch {}
+
+    // Try to close any open dialog to avoid blocking next booking
+    try {
+      const cancelBtn = page.locator('#dialog-close-button');
+      if (await cancelBtn.isVisible({ timeout: 1000 })) {
+        await cancelBtn.click();
+        await page.waitForTimeout(500);
+      }
     } catch {}
 
     return {
@@ -350,6 +384,11 @@ async function main() {
     console.log(`\n   Total: ${totalHours.toFixed(2)}h\n`);
     console.log('\n🔄 Starting booking (using same browser session)...\n');
 
+    // Navigate to TimeDiff only if we skipped scraping (scraping already leaves us on TimeDiff)
+    if (skipScrape) {
+      await navigateToTimeDiff(page);
+    }
+
     // Book worklogs
     const results: BookingResult[] = [];
     const startTime = Date.now();
@@ -361,7 +400,9 @@ async function main() {
       console.log(`[${i + 1}/${targetAttendance.length}] ${entry.date} (${entry.attendanceSAP}h)`);
       console.log('──────────────────────────────────────────────────');
 
-      for (const wl of distribution) {
+      for (let j = 0; j < distribution.length; j++) {
+        const wl = distribution[j];
+        const isLastForDate = j === distribution.length - 1;
         const input: CreateWorklogInput = {
           issueKey: wl.issueKey,
           date: entry.date,
@@ -369,7 +410,7 @@ async function main() {
           note: wl.note,
         };
 
-        const result = await createWorklogFast(page, input);
+        const result = await createWorklogFromTimeDiff(page, input, isLastForDate);
 
         results.push({
           date: entry.date,
