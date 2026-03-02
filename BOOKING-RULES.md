@@ -38,10 +38,10 @@ Hours are distributed based on whether `Math.floor(sapHours)` is even or odd:
 
 ## Success Validation
 
-After submitting each worklog, the script waits (5s timeout) for one of:
-1. AUI success banner (`.aui-message-success`) -> success
-2. AUI error banner / error alert -> failure
-3. No response -> treated as failure
+After submitting each worklog, the script polls (10s timeout) for one of:
+1. Dialog heading ("Log Work") becomes hidden -> success
+2. AUI error banner (`.aui-message-error`) appears -> failure
+3. Timeout (dialog still visible after 10s) -> treated as failure
 
 ## Files
 
@@ -64,4 +64,4 @@ npm run book -- --skip-scrape
 
 ---
 
-**Last Updated:** 2026-02-06
+**Last Updated:** 2026-02-26

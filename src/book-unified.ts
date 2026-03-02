@@ -4,16 +4,15 @@
  */
 
 import { Browser, Page } from 'playwright';
-import { ensureAuthenticated, launchBrowser, waitIfLoginRedirect } from './tempo-ui.js';
+import { ensureAuthenticated, launchBrowser, navigateToTimeDiff } from './tempo-ui.js';
 import { scrapeAttendanceFromTimeDiff, AttendanceEntry } from './scrape-attendance.js';
-import { CreateWorklogInput, CreateWorklogResult, JIRA_ISSUES, PROJECT_ROOT, TIMEDIFF_URL } from './types.js';
-import * as fs from 'fs';
+import { CreateWorklogInput, CreateWorklogResult, JIRA_ISSUES, PROJECT_ROOT } from './types.js';
+import * as fs from 'fs/promises';
 import * as path from 'path';
 
 interface WorklogDistribution {
   issueKey: string;
   hours: number;
-  note: string;
 }
 
 interface BookingResult {
@@ -27,75 +26,27 @@ interface BookingResult {
 function distributeHours(sapHours: number): WorklogDistribution[] {
   const isEven = Math.floor(sapHours) % 2 === 0;
 
+  let distribution: WorklogDistribution[];
+
   if (isEven) {
     // EVEN: 50/50 split
     const halfHours = sapHours / 2;
-    return [
-      {
-        issueKey: JIRA_ISSUES.PRIMARY,
-        hours: parseFloat(halfHours.toFixed(3)),
-        note: 'Daily work (50% split)',
-      },
-      {
-        issueKey: JIRA_ISSUES.SECONDARY,
-        hours: parseFloat(halfHours.toFixed(3)),
-        note: 'Daily work (50% split)',
-      },
+    distribution = [
+      { issueKey: JIRA_ISSUES.PRIMARY, hours: parseFloat(halfHours.toFixed(3)) },
+      { issueKey: JIRA_ISSUES.SECONDARY, hours: parseFloat(halfHours.toFixed(3)) },
     ];
   } else {
     // ODD: 1h to management, rest split 50/50
     const remainder = sapHours - 1.0;
     const halfRemainder = remainder / 2;
-    return [
-      {
-        issueKey: JIRA_ISSUES.MANAGEMENT,
-        hours: 1.0,
-        note: 'Management',
-      },
-      {
-        issueKey: JIRA_ISSUES.PRIMARY,
-        hours: parseFloat(halfRemainder.toFixed(3)),
-        note: 'Daily work (50% split)',
-      },
-      {
-        issueKey: JIRA_ISSUES.SECONDARY,
-        hours: parseFloat(halfRemainder.toFixed(3)),
-        note: 'Daily work (50% split)',
-      },
+    distribution = [
+      { issueKey: JIRA_ISSUES.MANAGEMENT, hours: 1.0 },
+      { issueKey: JIRA_ISSUES.PRIMARY, hours: parseFloat(halfRemainder.toFixed(3)) },
+      { issueKey: JIRA_ISSUES.SECONDARY, hours: parseFloat(halfRemainder.toFixed(3)) },
     ];
   }
-}
 
-/**
- * Navigate to the TimeDiff page and wait for the attendance table
- * AND SAP data to be fully loaded (SAP data loads asynchronously).
- */
-async function navigateToTimeDiff(page: Page): Promise<void> {
-  await page.goto(TIMEDIFF_URL, { waitUntil: 'domcontentloaded' });
-
-  if (page.url().includes('login') || page.url().includes('auth') || page.url().includes('sso')) {
-    await waitIfLoginRedirect(page);
-    await page.goto(TIMEDIFF_URL, { waitUntil: 'domcontentloaded' });
-  }
-
-  await page.waitForSelector('table', { timeout: 15000, state: 'visible' });
-
-  // Wait for SAP data to actually populate (loaded asynchronously)
-  await page.waitForFunction(`(() => {
-    const rows = document.querySelectorAll('table tr');
-    for (const row of rows) {
-      const firstCell = row.querySelector('td, th');
-      const label = (firstCell?.textContent || '').toLowerCase();
-      if (label.includes('attendance') && label.includes('sap')) {
-        const cells = row.querySelectorAll('td, th');
-        for (let i = 2; i < cells.length; i++) {
-          const text = (cells[i]?.textContent || '').trim();
-          if (/\\d/.test(text)) return true;
-        }
-      }
-    }
-    return false;
-  })()`, { timeout: 15000 });
+  return distribution.filter(d => d.hours > 0);
 }
 
 /**
@@ -198,38 +149,41 @@ async function createWorklogFromTimeDiff(page: Page, input: CreateWorklogInput, 
     // Click "Log Work" submit button
     await page.locator('#dialog-logwork-button').click();
 
-    // Wait for dialog to close (heading disappears) or error
-    const result = await Promise.race([
-      dialogHeading.waitFor({ timeout: 10000, state: 'hidden' })
-        .then(() => 'success' as const).catch(() => new Promise<never>(() => {})),
-      page.waitForSelector('.aui-message-error, .error-message', {
-        timeout: 10000, state: 'visible'
-      }).then(() => 'error' as const).catch(() => new Promise<never>(() => {})),
-      page.waitForTimeout(9000).then(() => 'timeout' as const),
-    ]);
-
-    if (result === 'success') {
-      await page.waitForTimeout(500); // Let page refresh difference values
-      console.log(`   ✅ ${issueKey} SUCCESS`);
-      return {
-        status: 'created',
-        message: `Worklog created: ${hours}h on ${date}`,
-      };
-    } else if (result === 'error') {
-      throw new Error('Error message appeared in the Log Work dialog');
-    } else {
-      // Timeout — check if dialog already closed
-      const headingStillVisible = await dialogHeading.isVisible().catch(() => false);
-      if (!headingStillVisible) {
+    // Poll for dialog close (success) or error message (failure)
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if (!(await dialogHeading.isVisible().catch(() => false))) {
+        // Wait for table data to repopulate after page auto-refresh:
+        // 1) waitForFunction ensures the refresh has started (difference row has data)
+        // 2) fixed delay lets remaining cells finish (they load asynchronously cell-by-cell)
+        await page.waitForFunction(`(() => {
+          const rows = document.querySelectorAll('table tr');
+          for (const row of rows) {
+            const firstCell = row.querySelector('td, th');
+            const label = (firstCell?.textContent || '').toLowerCase();
+            if (label.includes('differ')) {
+              const cells = row.querySelectorAll('td, th');
+              for (let i = 2; i < cells.length; i++) {
+                const text = (cells[i]?.textContent || '').trim();
+                if (/\\d/.test(text)) return true;
+              }
+            }
+          }
+          return false;
+        })()`, { timeout: 5000 }).catch(() => {});
         await page.waitForTimeout(500);
-        console.log(`   ✅ ${issueKey} SUCCESS (dialog closed)`);
+        console.log(`   ✅ ${issueKey} SUCCESS`);
         return {
           status: 'created',
           message: `Worklog created: ${hours}h on ${date}`,
         };
       }
-      throw new Error('Timeout: dialog did not close after clicking Log Work');
+      if (await page.locator('.aui-message-error, .error-message').isVisible().catch(() => false)) {
+        throw new Error('Error message appeared in the Log Work dialog');
+      }
+      await page.waitForTimeout(300);
     }
+    throw new Error('Timeout: dialog did not close after clicking Log Work');
 
   } catch (error) {
     console.error(`   ❌ ${issueKey} FAILED: ${error}`);
@@ -237,14 +191,14 @@ async function createWorklogFromTimeDiff(page: Page, input: CreateWorklogInput, 
     // Screenshot on failure
     try {
       const artifactsDir = path.join(PROJECT_ROOT, 'artifacts');
-      if (!fs.existsSync(artifactsDir)) {
-        fs.mkdirSync(artifactsDir, { recursive: true });
-      }
+      await fs.mkdir(artifactsDir, { recursive: true });
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const screenshotPath = path.join(artifactsDir, `error-${issueKey}-${date}-${timestamp}.png`);
       await page.screenshot({ path: screenshotPath, fullPage: true });
       console.error(`   📸 Screenshot: ${screenshotPath}`);
-    } catch {}
+    } catch (screenshotErr) {
+      console.warn(`   ⚠️  Could not capture error screenshot: ${screenshotErr}`);
+    }
 
     // Try to close any open dialog to avoid blocking next booking
     try {
@@ -253,7 +207,9 @@ async function createWorklogFromTimeDiff(page: Page, input: CreateWorklogInput, 
         await cancelBtn.click();
         await page.waitForTimeout(500);
       }
-    } catch {}
+    } catch (dismissErr) {
+      console.warn(`   ⚠️  Could not dismiss dialog: ${dismissErr}`);
+    }
 
     return {
       status: 'failed',
@@ -293,22 +249,17 @@ async function main() {
     if (skipScrape) {
       console.log('🔄 STEP 1: Using existing attendance data (scraping skipped)...\n');
 
-      if (fs.existsSync(ATTENDANCE_FILE)) {
-        try {
-          const existingData = JSON.parse(fs.readFileSync(ATTENDANCE_FILE, 'utf-8'));
-          if (Array.isArray(existingData) && existingData.length > 0) {
-            allAttendance = existingData;
-            console.log(`   ✅ Loaded ${allAttendance.length} entries from ${ATTENDANCE_FILE}\n`);
-          } else {
-            console.error('   ❌ Existing file is empty or invalid.');
-            process.exit(1);
-          }
-        } catch (error) {
-          console.error(`   ❌ Failed to read existing file: ${error}`);
+      try {
+        const existingData = JSON.parse(await fs.readFile(ATTENDANCE_FILE, 'utf-8'));
+        if (Array.isArray(existingData) && existingData.length > 0) {
+          allAttendance = existingData;
+          console.log(`   ✅ Loaded ${allAttendance.length} entries from ${ATTENDANCE_FILE}\n`);
+        } else {
+          console.error('   ❌ Existing file is empty or invalid.');
           process.exit(1);
         }
-      } else {
-        console.error('   ❌ No existing attendance data found.');
+      } catch (error) {
+        console.error(`   ❌ Failed to read existing attendance file: ${error}`);
         console.error('   💡 Run without --skip-scrape to fetch fresh data.');
         process.exit(1);
       }
@@ -317,10 +268,10 @@ async function main() {
 
       // Backup existing file before scraping
       let backupData: AttendanceEntry[] = [];
-      if (fs.existsSync(ATTENDANCE_FILE)) {
-        try {
-          backupData = JSON.parse(fs.readFileSync(ATTENDANCE_FILE, 'utf-8'));
-        } catch {}
+      try {
+        backupData = JSON.parse(await fs.readFile(ATTENDANCE_FILE, 'utf-8'));
+      } catch {
+        // No existing file or invalid JSON — no backup available
       }
 
       // Scrape attendance data using the same authenticated session
@@ -333,7 +284,7 @@ async function main() {
         // Restore backup if available
         if (backupData.length > 0) {
           console.warn('   ℹ️  Restoring backup data...');
-          fs.writeFileSync(ATTENDANCE_FILE, JSON.stringify(backupData, null, 2));
+          await fs.writeFile(ATTENDANCE_FILE, JSON.stringify(backupData, null, 2));
           allAttendance = backupData;
           console.log(`   ✅ Using backup data with ${allAttendance.length} entries\n`);
         } else {
@@ -400,17 +351,24 @@ async function main() {
       console.log(`[${i + 1}/${targetAttendance.length}] ${entry.date} (${entry.attendanceSAP}h)`);
       console.log('──────────────────────────────────────────────────');
 
+      let dateHasFailure = false;
+
       for (let j = 0; j < distribution.length; j++) {
         const wl = distribution[j];
         const isLastForDate = j === distribution.length - 1;
+        // Only use remaining diff if last booking AND no prior failures for this date
+        const useRemaining = isLastForDate && !dateHasFailure;
         const input: CreateWorklogInput = {
           issueKey: wl.issueKey,
           date: entry.date,
           hours: wl.hours,
-          note: wl.note,
         };
 
-        const result = await createWorklogFromTimeDiff(page, input, isLastForDate);
+        const result = await createWorklogFromTimeDiff(page, input, useRemaining);
+
+        if (result.status === 'failed') {
+          dateHasFailure = true;
+        }
 
         results.push({
           date: entry.date,
@@ -419,12 +377,6 @@ async function main() {
           status: result.status,
           message: result.message,
         });
-
-        await page.waitForTimeout(400); // Small delay between worklogs
-      }
-
-      if (i < targetAttendance.length - 1) {
-        await page.waitForTimeout(800); // Delay between dates
       }
 
       console.log('');
@@ -464,7 +416,7 @@ async function main() {
     }
 
     // Save results
-    fs.writeFileSync(resultsFileName, JSON.stringify(results, null, 2));
+    await fs.writeFile(resultsFileName, JSON.stringify(results, null, 2));
     console.log(`💾 Results saved to: ${resultsFileName}\n`);
 
     if (failed === 0) {

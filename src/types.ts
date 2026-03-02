@@ -1,3 +1,4 @@
+import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -5,13 +6,26 @@ import { fileURLToPath } from 'url';
 export const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
- * Jira issue keys used for worklog distribution
+ * Jira issue keys used for worklog distribution.
+ * Read from config.json at project root; falls back to defaults if missing.
  */
-export const JIRA_ISSUES = {
-  PRIMARY: 'PFLUITS-3554',
-  SECONDARY: 'TAU-96',
-  MANAGEMENT: 'ARTQMPM-171',
-} as const;
+function loadJiraIssues(): { PRIMARY: string; SECONDARY: string; MANAGEMENT: string } {
+  const defaults = { PRIMARY: 'PFLUITS-3554', SECONDARY: 'TAU-96', MANAGEMENT: 'ARTQMPM-171' };
+  const configPath = path.join(PROJECT_ROOT, 'config.json');
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const issues = raw?.jiraIssues;
+    if (issues?.primary && issues?.secondary && issues?.management) {
+      return { PRIMARY: issues.primary, SECONDARY: issues.secondary, MANAGEMENT: issues.management };
+    }
+    console.warn('   ⚠️  config.json missing jiraIssues fields, using defaults.');
+    return defaults;
+  } catch {
+    return defaults;
+  }
+}
+
+export const JIRA_ISSUES = loadJiraIssues();
 
 export const JIRA_BASE_URL = 'https://jira.uniqagroup.com';
 export const TIMEDIFF_URL = `${JIRA_BASE_URL}/secure/TimeDiff.jspa`;

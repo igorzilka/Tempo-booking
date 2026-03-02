@@ -1,7 +1,7 @@
 import { Page } from 'playwright';
-import * as fs from 'fs';
-import { PROJECT_ROOT, TIMEDIFF_URL } from './types.js';
-import { waitIfLoginRedirect } from './tempo-ui.js';
+import * as fs from 'fs/promises';
+import { PROJECT_ROOT } from './types.js';
+import { navigateToTimeDiff } from './tempo-ui.js';
 import * as path from 'path';
 
 export interface AttendanceEntry {
@@ -21,43 +21,8 @@ export async function scrapeAttendanceFromTimeDiff(page: Page): Promise<ScrapeAt
   console.log('\n📊 Scraping attendance data from TimeDiff page...');
 
   try {
-    console.log(`   → Navigating to: ${TIMEDIFF_URL}`);
-    await page.goto(TIMEDIFF_URL, { waitUntil: 'domcontentloaded' });
-
-    // If SSO session expired, wait for re-authentication then reload TimeDiff
-    if (page.url().includes('login') || page.url().includes('auth') || page.url().includes('sso')) {
-      await waitIfLoginRedirect(page);
-      await page.goto(TIMEDIFF_URL, { waitUntil: 'domcontentloaded' });
-    }
-
-    console.log('   → Waiting for attendance table to load...');
-
-    try {
-      await page.waitForSelector('table', { timeout: 15000, state: 'visible' });
-    } catch (error) {
-      throw new Error('Could not find attendance table.');
-    }
-
-    // Wait for the SAP row to contain actual numeric data (not just the table structure)
-    try {
-      await page.waitForFunction(`(() => {
-        const rows = document.querySelectorAll('table tr');
-        for (const row of rows) {
-          const firstCell = row.querySelector('td, th');
-          const label = (firstCell?.textContent || '').toLowerCase();
-          if (label.includes('attendance') && label.includes('sap')) {
-            const cells = row.querySelectorAll('td, th');
-            for (let i = 2; i < cells.length; i++) {
-              const text = (cells[i]?.textContent || '').trim();
-              if (/\\d/.test(text)) return true;
-            }
-          }
-        }
-        return false;
-      })()`, { timeout: 15000 });
-    } catch (error) {
-      throw new Error('Attendance table visible but SAP data did not load.');
-    }
+    console.log('   → Navigating to TimeDiff and waiting for SAP data...');
+    await navigateToTimeDiff(page);
 
     console.log('   → Extracting table data...');
 
@@ -162,7 +127,7 @@ export async function scrapeAttendanceFromTimeDiff(page: Page): Promise<ScrapeAt
     }
 
     const outputPath = path.join(PROJECT_ROOT, 'scraped-attendance.json');
-    fs.writeFileSync(outputPath, JSON.stringify(entries, null, 2));
+    await fs.writeFile(outputPath, JSON.stringify(entries, null, 2));
     console.log(`   💾 Saved to: ${outputPath}\n`);
 
     return {
