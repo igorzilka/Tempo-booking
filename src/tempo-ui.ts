@@ -7,11 +7,12 @@ import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { JIRA_BASE_URL, TIMEDIFF_URL } from './types.js';
 
 /**
- * Launch a headed Chromium browser with standard viewport.
- * Centralises browser config so book-unified and scrape-cli stay in sync.
+ * Launch a headed Chrome browser with standard viewport.
+ * Uses the system-installed Chrome instead of Playwright's bundled Chromium.
  */
 export async function launchBrowser(): Promise<{ browser: Browser; context: BrowserContext; page: Page }> {
   const browser = await chromium.launch({
+    channel: 'chrome',
     headless: false,
     args: ['--start-maximized'],
   });
